@@ -57,5 +57,37 @@ def change_id(id: int, new_id: int):
     db.close()
     return f"Employee {id} id changed to {new_id}"
 
+@mcp.tool()
+def delete_employee_by_name(name: str):
+    db = session()
+    employee = db.query(Employee).filter(Employee.name == name).first()
+    if not employee:
+        return "Employee not found"
+    db.delete(employee)
+    db.commit()
+    db.close()
+    return f"Employee {name} deleted successfully"
+
+@mcp.tool()
+def search_employee_by_name(name: str):
+    db = session()
+    employee = db.query(Employee).filter(Employee.name == name).first()
+    db.close()
+    return employee
+
+@mcp.tool()
+def search_employee_by_id(id: int):
+    db = session()
+    employee = db.query(Employee).filter(Employee.id == id).first()
+    db.close()
+    return employee
+
+@mcp.tool()
+def search_employee_by_role(role: str):
+    db = session()
+    employee = db.query(Employee).filter(Employee.role == role).all()
+    db.close()
+    return employee
+
 if __name__ == "__main__":
     mcp.run()
