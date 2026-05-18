@@ -3,67 +3,74 @@ import asyncio
 import json
 import os
 import pandas as pd
+import concurrent.futures
+import sqlite3
+
 from dotenv import load_dotenv
 from groq import Groq
 from fastmcp import Client
 import sentry_sdk
 import openlit
 
-# Load environment variables
 load_dotenv()
+openlit.init(disable_metrics=True)
 
-# Initialize OpenLIT
-openlit.init()
-print("OpenLIT initialized")
-
-# Initialize Sentry
 sentry_sdk.init(
     dsn=os.getenv("SENTRY_DSN"),
     traces_sample_rate=1.0,
 )
 
-# Check API Key
 if not os.getenv("GROQ_API_KEY"):
     st.error("GROQ_API_KEY is missing. Please add it to your .env file.")
     st.stop()
 
-# Initialize Groq Client
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # =========================================
-# ROLE BASED ACCESS CONTROL (RBAC)
+# MCP SERVER URL
+# Run `python server.py` in a separate terminal first
+# =========================================
+
+MCP_SERVER_URL = "http://localhost:8000/sse"
+
+# =========================================
+# DATABASE PATH — must match DATABASE_URL in database.py
+# =========================================
+
+DB_PATH = "./test.db"
+
+# =========================================
+# ASYNC RUNNER
+# Runs coroutines in an isolated thread so
+# Streamlit's event loop is never touched.
+# =========================================
+
+def run_async(coro):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, coro)
+        return future.result()
+
+# =========================================
+# RBAC
 # =========================================
 
 ROLE_PERMISSIONS = {
     "admin": [
-        "create_employee",
-        "delete_employee",
-        "update_employee",
-        "list_employees",
-        "get_table_schema",
-        "execute_read_query",
-        "execute_write_query",
+        "create_employee", "delete_employee", "update_employee",
+        "list_employees", "get_table_schema",
+        "execute_read_query", "execute_write_query",
     ],
     "hr": [
-        "create_employee",
-        "update_employee",
-        "list_employees",
-        "get_table_schema",
-        "execute_read_query",
-        "execute_write_query",
+        "create_employee", "update_employee", "list_employees",
+        "get_table_schema", "execute_read_query", "execute_write_query",
     ],
     "viewer": [
-        "list_employees",
-        "get_table_schema",
-        "execute_read_query",
+        "list_employees", "get_table_schema", "execute_read_query",
     ],
 }
 
-
 def has_permission(role, tool_name):
-    allowed_tools = ROLE_PERMISSIONS.get(role, [])
-    return tool_name in allowed_tools
-
+    return tool_name in ROLE_PERMISSIONS.get(role, [])
 
 # =========================================
 # SYSTEM PROMPTS
@@ -71,84 +78,158 @@ def has_permission(role, tool_name):
 
 SYSTEM_PROMPT = """
 You are an employee management assistant.
-
-You help users manage employees using the available tools.
-
-Rules:
+Help users manage employees using the available tools.
 - ONLY use tools allowed for the current role.
-- Never attempt restricted tools.
 - If user asks for unauthorized action, explain politely.
-
-When listing employees:
-- Present results in clean readable format.
-
-When creating/deleting/updating employees:
-- Confirm the action clearly.
+- Present employee lists in a clean readable format.
+- Confirm create/delete/update actions clearly.
 """
 
 NL_SQL_SYSTEM_PROMPT = """You are a SQLite SQL expert.
 Given a database schema and a natural language request, write a precise SQLite SQL statement.
-
 Rules:
-- Return ONLY the raw SQL — no markdown fences, no backticks, no explanation.
-- Use proper SQLite syntax and quoting.
+- Return ONLY the raw SQL — no markdown, no backticks, no explanation.
+- Use proper SQLite syntax.
 - Never generate DROP, CREATE, ALTER, or TRUNCATE statements.
 - Prefer explicit column names over SELECT *.
 """
 
 # =========================================
-# HELPER FUNCTIONS
+# HELPERS
 # =========================================
-
 
 def mcp_tools_to_groq_format(tools):
-    """Convert MCP tool definitions to Groq/OpenAI function calling format."""
-    groq_tools = []
-    for tool in tools:
-        groq_tools.append({
+    return [
+        {
             "type": "function",
             "function": {
-                "name": tool.name,
-                "description": tool.description or "",
-                "parameters": tool.inputSchema,
+                "name": t.name,
+                "description": t.description or "",
+                "parameters": t.inputSchema,
             },
-        })
-    return groq_tools
+        }
+        for t in tools
+    ]
 
-
-def _extract_text_from_mcp_result(result) -> str:
-    """Safely extract a plain string from an MCP tool result."""
-    if isinstance(result, str):
-        return result
-    # FastMCP wraps results in content objects
-    if hasattr(result, "__iter__"):
-        for item in result:
-            if hasattr(item, "text"):
-                return item.text
-    return str(result)
-
+def extract_text(result) -> str:
+    try:
+        return result.content[0].text
+    except (AttributeError, IndexError):
+        pass
+    return str(result) if not isinstance(result, str) else result
 
 # =========================================
-# CHAT AI FUNCTION (existing)
+# SQL — direct SQLite (no MCP, no subprocess)
 # =========================================
 
+def db_get_schema() -> str:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+        tables = cursor.fetchall()
+        if not tables:
+            conn.close()
+            return "No tables found."
+        parts = []
+        for (table_name,) in tables:
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = cursor.fetchall()
+            col_defs = []
+            for col in columns:
+                defn = f"  {col[1]} {col[2]}"
+                if col[5]: defn += "  PRIMARY KEY"
+                if col[3]: defn += "  NOT NULL"
+                col_defs.append(defn)
+            parts.append(
+                f"CREATE TABLE {table_name} (\n" + ",\n".join(col_defs) + "\n);"
+            )
+        conn.close()
+        return "\n\n".join(parts)
+    except sqlite3.Error as e:
+        return f"Schema error: {e}"
 
-async def run_query(messages):
-    async with Client("server.py") as client:
 
+def db_execute_read(sql: str) -> dict:
+    sql = sql.strip()
+    if not sql.upper().startswith("SELECT"):
+        return {"error": "Only SELECT queries are allowed."}
+    for kw in ["DROP ", "DELETE ", "INSERT ", "UPDATE ", "ALTER ", "CREATE "]:
+        if kw in sql.upper():
+            return {"error": f"Forbidden keyword: {kw.strip()}"}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        columns = [d[0] for d in cursor.description] if cursor.description else []
+        rows = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return {"columns": columns, "rows": rows, "count": len(rows)}
+    except sqlite3.Error as e:
+        return {"error": str(e)}
+
+
+def db_execute_write(sql: str) -> dict:
+    sql = sql.strip()
+    first_word = sql.upper().split()[0] if sql else ""
+    if first_word not in ("INSERT", "UPDATE", "DELETE"):
+        return {"error": "Only INSERT, UPDATE, DELETE are allowed."}
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        conn.commit()
+        affected = cursor.rowcount
+        conn.close()
+        return {"success": True, "operation": first_word, "rows_affected": affected}
+    except sqlite3.Error as e:
+        if conn:
+            conn.rollback()
+            conn.close()
+        return {"error": str(e)}
+
+
+def generate_sql(nl_query: str, schema: str, role: str) -> str:
+    read_only = (
+        "\nIMPORTANT: Read-only user — generate ONLY a SELECT query."
+        if role == "viewer" else ""
+    )
+    prompt = (
+        f"Database schema:\n{schema}\n\n"
+        f'Request: "{nl_query}"{read_only}\n\nSQL:'
+    )
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": NL_SQL_SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ],
+        temperature=0.1,
+    )
+    sql = response.choices[0].message.content.strip()
+    return sql.replace("```sql", "").replace("```", "").strip()
+
+# =========================================
+# CHAT — uses MCP over HTTP
+# NOTE: all st.session_state values are passed
+# as plain arguments — never accessed inside
+# the async function running in a worker thread.
+# =========================================
+
+async def run_query(messages, current_role):
+    async with Client(MCP_SERVER_URL) as client:
         tools = await client.list_tools()
         groq_tools = mcp_tools_to_groq_format(tools)
-        current_role = st.session_state.user_role
 
-        role_prompt = f"""
-Current user role: {current_role}
-
-Allowed tools:
-{ROLE_PERMISSIONS[current_role]}
-
-Important:
-- Never use tools outside these permissions.
-"""
+        role_prompt = (
+            f"\nCurrent user role: {current_role}\n"
+            f"Allowed tools: {ROLE_PERMISSIONS[current_role]}\n"
+            "Never use tools outside these permissions.\n"
+        )
 
         try:
             response = groq_client.chat.completions.create(
@@ -160,14 +241,11 @@ Important:
                 tool_choice="auto",
             )
             assistant_message = response.choices[0].message
-
         except Exception as e:
             sentry_sdk.capture_exception(e)
-            print("Error in initial AI response:", e)
             raise
 
         while assistant_message.tool_calls:
-
             messages.append({
                 "role": "assistant",
                 "tool_calls": [
@@ -183,38 +261,34 @@ Important:
                 ],
             })
 
-            for tool_call in assistant_message.tool_calls:
+            for tc in assistant_message.tool_calls:
+                tool_name = tc.function.name
+                tool_args = json.loads(tc.function.arguments)
 
-                tool_name = tool_call.function.name
-                tool_args = json.loads(tool_call.function.arguments)
+                # Note: we cannot use st.chat_message here (worker thread)
+                # Tool call info is included in the final message instead
+                print(f"[Tool] {tool_name} → {tool_args}")
 
-                with st.chat_message("tool", avatar="🛠️"):
-                    st.write(
-                        f"Attempting tool: `{tool_name}` with args: {tool_args}"
-                    )
-
-                user_role = st.session_state.user_role
-
-                if not has_permission(user_role, tool_name):
-                    result = (
-                        f"❌ ACCESS DENIED\n\n"
-                        f"Role `{user_role}` cannot access `{tool_name}`"
+                if not has_permission(current_role, tool_name):
+                    result_text = (
+                        f"❌ ACCESS DENIED — "
+                        f"`{current_role}` cannot use `{tool_name}`"
                     )
                     sentry_sdk.capture_message(
-                        f"Unauthorized access attempt | "
-                        f"Role: {user_role} | Tool: {tool_name}"
+                        f"Unauthorized | Role: {current_role} | Tool: {tool_name}"
                     )
                 else:
                     try:
-                        result = await client.call_tool(tool_name, tool_args)
+                        raw = await client.call_tool(tool_name, tool_args)
+                        result_text = extract_text(raw)
                     except Exception as e:
                         sentry_sdk.capture_exception(e)
-                        result = f"❌ Tool execution failed:\n\n{str(e)}"
+                        result_text = f"❌ Tool failed: {e}"
 
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": str(result),
+                    "tool_call_id": tc.id,
+                    "content": result_text,
                 })
 
             response = groq_client.chat.completions.create(
@@ -227,73 +301,9 @@ Important:
             )
             assistant_message = response.choices[0].message
 
-        messages.append({
-            "role": "assistant",
-            "content": assistant_message.content,
-        })
+        messages.append({"role": "assistant", "content": assistant_message.content})
         return assistant_message.content, messages
 
-
-# =========================================
-# NL → SQL FUNCTIONS
-# =========================================
-
-
-async def fetch_schema() -> str:
-    """Fetch the live database schema via MCP."""
-    async with Client("server.py") as client:
-        result = await client.call_tool("get_table_schema", {})
-    try:
-        return result.content[0].text
-    except (AttributeError, IndexError):
-        return str(result)
-
-
-async def generate_sql_from_nl(nl_query: str, schema: str, role: str) -> str:
-    """Use Groq to turn a natural-language query into a SQL statement."""
-
-    read_only_note = (
-        "\nIMPORTANT: This user has read-only access — "
-        "generate ONLY a SELECT query."
-        if role == "viewer"
-        else ""
-    )
-
-    prompt = (
-        f"Database schema:\n{schema}\n\n"
-        f'Natural language request: "{nl_query}"{read_only_note}\n\n'
-        "SQL:"
-    )
-
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": NL_SQL_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.1,  # low temperature → more deterministic SQL
-    )
-
-    sql = response.choices[0].message.content.strip()
-    # Strip accidental markdown fences
-    sql = sql.replace("```sql", "").replace("```", "").strip()
-    return sql
-
-
-
-async def execute_sql_via_mcp(sql: str, is_write: bool) -> dict:
-    """Execute a SQL query through the MCP server and return a parsed dict."""
-    tool_name = "execute_write_query" if is_write else "execute_read_query"
-    async with Client("server.py") as client:
-        result = await client.call_tool(tool_name, {"sql": sql})
-    try:
-        raw = result.content[0].text
-    except (AttributeError, IndexError):
-        raw = str(result)
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {"raw": raw}
 # =========================================
 # STREAMLIT UI
 # =========================================
@@ -303,28 +313,22 @@ st.set_page_config(
     page_icon="👨‍💼",
     layout="wide",
 )
-
 st.title("👨‍💼 Employee Manager AI")
 st.caption("Manage employees with AI + MCP + RBAC")
 
-# =========================================
-# SESSION STATE
-# =========================================
+# ── Session state (must come before any widget) ───────────────────────────────
 
-defaults = {
+for key, val in {
     "messages": [],
     "user_role": "viewer",
     "db_schema": None,
     "generated_sql": "",
     "sql_result": None,
-}
-for key, val in defaults.items():
+}.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
-# =========================================
-# SIDEBAR
-# =========================================
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
 st.sidebar.title("🔐 Access Control")
 
@@ -334,7 +338,6 @@ selected_role = st.sidebar.selectbox(
     index=["admin", "hr", "viewer"].index(st.session_state.user_role),
 )
 
-# Reset SQL state on role change
 if selected_role != st.session_state.user_role:
     st.session_state.generated_sql = ""
     st.session_state.sql_result = None
@@ -343,55 +346,56 @@ st.session_state.user_role = selected_role
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("✅ Allowed Permissions")
-for permission in ROLE_PERMISSIONS[selected_role]:
-    st.sidebar.success(permission)
+for p in ROLE_PERMISSIONS[selected_role]:
+    st.sidebar.success(p)
 
-# =========================================
-# TABS
-# =========================================
+st.sidebar.markdown("---")
+st.sidebar.subheader("🖥️ MCP Server")
+st.sidebar.code("python server.py", language="bash")
+st.sidebar.caption("Run in a separate terminal before using the Chat tab.")
+
+# ── Tabs ──────────────────────────────────────────────────────────────────────
 
 tab_chat, tab_sql = st.tabs(["💬 Chat", "🗄️ SQL Assistant"])
 
 # ──────────────────────────────────────────
-# TAB 1 — CHAT (existing functionality)
+# TAB 1 — CHAT
 # ──────────────────────────────────────────
 
 with tab_chat:
 
-    # Display chat history
-    for message in st.session_state.messages:
-        if message["role"] == "user":
+    for msg in st.session_state.messages:
+        if msg["role"] == "user":
             with st.chat_message("user"):
-                st.markdown(message["content"])
-        elif (
-            message["role"] == "assistant"
-            and "content" in message
-            and message["content"]
-        ):
+                st.markdown(msg["content"])
+        elif msg["role"] == "assistant" and msg.get("content"):
             with st.chat_message("assistant", avatar="🤖"):
-                st.markdown(message["content"])
+                st.markdown(msg["content"])
 
-    # User input
-    if prompt := st.chat_input("Example: Create employee John as Designer"):
+    if prompt := st.chat_input("Example: List all employees"):
 
         st.chat_message("user").markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
 
+        # Read session state values BEFORE entering the worker thread
+        messages_snapshot = list(st.session_state.messages)
+        role_snapshot     = st.session_state.user_role
+
         with st.spinner("AI is thinking..."):
             try:
-                final_content, updated_messages = asyncio.run(
-                    run_query(list(st.session_state.messages))
+                final_content, updated = run_async(
+                    run_query(messages_snapshot, role_snapshot)
                 )
-                st.session_state.messages = updated_messages
+                st.session_state.messages = updated
                 with st.chat_message("assistant", avatar="🤖"):
                     st.markdown(final_content)
 
             except Exception as e:
                 sentry_sdk.capture_exception(e)
-                st.error(f"Application Error: {str(e)}")
+                st.error(f"Application Error: {e}")
 
 # ──────────────────────────────────────────
-# TAB 2 — NL SQL ASSISTANT
+# TAB 2 — SQL ASSISTANT (direct DB, no MCP)
 # ──────────────────────────────────────────
 
 with tab_sql:
@@ -401,89 +405,60 @@ with tab_sql:
 
     role = st.session_state.user_role
 
-    # Role info banner
     if role == "viewer":
         st.info(
-            "👁️ **Read-only access** — only SELECT queries will be generated and allowed.",
+            "👁️ **Read-only access** — only SELECT queries allowed.",
             icon="ℹ️",
         )
     else:
         st.success(
-            f"✏️ **{role.upper()} access** — SELECT and write queries (INSERT / UPDATE / DELETE) are enabled.",
+            f"✏️ **{role.upper()} access** — read and write queries enabled.",
             icon="✅",
         )
 
     st.markdown("---")
 
-    # ── Schema Panel ─────────────────────────────────────────────────────────
-
-    schema_col, btn_col = st.columns([5, 1])
-
-    with schema_col:
-        schema_expander = st.expander(
-            "📋 Database Schema" + (" (loaded)" if st.session_state.db_schema else ""),
+    # Schema panel
+    s_col, b_col = st.columns([5, 1])
+    with s_col:
+        expander = st.expander(
+            "📋 Database Schema"
+            + (" (loaded)" if st.session_state.db_schema else ""),
             expanded=False,
         )
-
-    with btn_col:
-        if st.button("🔄 Load", use_container_width=True, help="Fetch live schema"):
-            with st.spinner("Fetching schema..."):
-                try:
-                    st.session_state.db_schema = asyncio.run(fetch_schema())
-                except Exception as e:
-                    sentry_sdk.capture_exception(e)
-                    st.error(f"Could not load schema: {e}")
+    with b_col:
+        if st.button("🔄 Load", use_container_width=True):
+            st.session_state.db_schema = db_get_schema()
 
     if st.session_state.db_schema:
-        with schema_expander:
+        with expander:
             st.code(st.session_state.db_schema, language="sql")
     else:
-        with schema_expander:
-            st.caption("Click **🔄 Load** to fetch the current schema.")
+        with expander:
+            st.caption("Click **🔄 Load** to fetch the schema.")
 
     st.markdown("---")
 
-    # ── NL Input ─────────────────────────────────────────────────────────────
-
+    # Natural language input
     nl_query = st.text_input(
         "Describe what you want in plain English",
-        placeholder=(
-            "e.g. Show all employees in Engineering hired after 2023"
-            if role == "viewer"
-            else "e.g. Update salary to 90000 for employees in Marketing"
-        ),
+        placeholder="e.g. Show all employees hired after 2022",
         key="nl_sql_input",
     )
 
-    generate_btn = st.button(
-        "⚡ Generate SQL",
-        disabled=not nl_query.strip(),
-        use_container_width=False,
-    )
-
-    if generate_btn and nl_query.strip():
-        with st.spinner("Generating SQL with Groq..."):
+    if st.button("⚡ Generate SQL", disabled=not nl_query.strip()):
+        with st.spinner("Generating SQL..."):
             try:
-                # Auto-load schema if needed
                 if not st.session_state.db_schema:
-                    st.session_state.db_schema = asyncio.run(fetch_schema())
-
-                generated = asyncio.run(
-                    generate_sql_from_nl(
-                        nl_query,
-                        st.session_state.db_schema,
-                        role,
-                    )
-                )
-                st.session_state.generated_sql = generated
-                st.session_state.sql_result = None  # clear previous results
-
+                    st.session_state.db_schema = db_get_schema()
+                sql = generate_sql(nl_query, st.session_state.db_schema, role)
+                st.session_state.generated_sql = sql
+                st.session_state.sql_result = None
             except Exception as e:
                 sentry_sdk.capture_exception(e)
                 st.error(f"SQL generation failed: {e}")
 
-    # ── SQL Editor ───────────────────────────────────────────────────────────
-
+    # SQL editor
     if st.session_state.generated_sql:
 
         st.markdown("**✏️ Generated SQL** — review and edit before executing:")
@@ -496,42 +471,38 @@ with tab_sql:
             key="sql_editor",
         )
 
-        # Detect operation type
-        first_word = edited_sql.strip().upper().split()[0] if edited_sql.strip() else ""
+        first_word = (
+            edited_sql.strip().upper().split()[0] if edited_sql.strip() else ""
+        )
         is_write = first_word in ("INSERT", "UPDATE", "DELETE")
 
-        # RBAC gate for write queries
         if is_write and not has_permission(role, "execute_write_query"):
             st.warning(
-                f"⚠️ Role **{role}** does not have permission to run `{first_word}` queries.",
+                f"⚠️ Role **{role}** cannot run `{first_word}` queries.",
                 icon="🚫",
             )
             sentry_sdk.capture_message(
-                f"Blocked write SQL attempt | Role: {role} | Op: {first_word}"
+                f"Blocked write SQL | Role: {role} | Op: {first_word}"
             )
-
         else:
-            # Differentiate button style for destructive operations
             if is_write:
                 st.warning(
-                    f"⚠️ This is a **{first_word}** query and will modify data.",
+                    f"⚠️ This **{first_word}** query will modify data.",
                     icon="⚠️",
                 )
                 exec_label = f"⚠️ Execute {first_word}"
             else:
                 exec_label = "▶️ Execute Query"
 
-            if st.button(exec_label, use_container_width=False):
-                with st.spinner("Executing..."):
-                    try:
-                        result = asyncio.run(execute_sql_via_mcp(edited_sql, is_write))
-                        st.session_state.sql_result = result
-                    except Exception as e:
-                        sentry_sdk.capture_exception(e)
-                        st.error(f"Execution error: {e}")
+            if st.button(exec_label):
+                result = (
+                    db_execute_write(edited_sql)
+                    if is_write
+                    else db_execute_read(edited_sql)
+                )
+                st.session_state.sql_result = result
 
-    # ── Results ──────────────────────────────────────────────────────────────
-
+    # Results
     if st.session_state.sql_result:
 
         st.markdown("---")
@@ -541,31 +512,24 @@ with tab_sql:
             st.error(f"❌ **Query Error:** {result['error']}")
 
         elif "rows" in result:
-            # SELECT results → DataFrame
-            count = result.get("count", len(result["rows"]))
-            st.success(f"✅ {count} row(s) returned")
-
+            st.success(f"✅ {result.get('count', 0)} row(s) returned")
             if result["rows"]:
                 df = pd.DataFrame(result["rows"])
                 st.dataframe(df, use_container_width=True, hide_index=True)
-
-                # CSV download
-                csv = df.to_csv(index=False).encode("utf-8")
                 st.download_button(
-                    label="⬇️ Download as CSV",
-                    data=csv,
-                    file_name="query_results.csv",
+                    "⬇️ Download as CSV",
+                    data=df.to_csv(index=False).encode("utf-8"),
+                    file_name="results.csv",
                     mime="text/csv",
                 )
             else:
-                st.info("Query executed successfully — no rows matched.")
+                st.info("No rows matched.")
 
         elif "rows_affected" in result:
-            # Write operation success
-            op = result.get("operation", "Query")
-            affected = result.get("rows_affected", 0)
-            st.success(f"✅ **{op}** successful — {affected} row(s) affected.")
+            st.success(
+                f"✅ **{result.get('operation')}** successful — "
+                f"{result.get('rows_affected', 0)} row(s) affected."
+            )
 
         else:
-            # Fallback: show raw output
             st.text(result.get("raw", str(result)))

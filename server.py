@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from database import session, Employee
+from database import Session, Employee
 
 load_dotenv()
 import sqlite3
@@ -12,7 +12,7 @@ mcp = FastMCP("employee-manager")
 @mcp.tool()
 def create_employee(name: str, role: str):
     """Create a new employee with a name and role."""
-    db = session()
+    db = Session()
     employee = Employee(name=name, role=role)
     db.add(employee)
     db.commit()
@@ -23,7 +23,7 @@ def create_employee(name: str, role: str):
 @mcp.tool()
 def list_employees():
     """List all employees."""
-    db = session()
+    db = Session()
     employees = db.query(Employee).all()
     db.close()
     return [str(e) for e in employees]
@@ -32,7 +32,7 @@ def list_employees():
 @mcp.tool()
 def delete_employee(id: int):
     """Delete an employee by their ID."""
-    db = session()
+    db = Session()
     employee = db.query(Employee).filter(Employee.id == id).first()
     if not employee:
         return "Employee not found"
@@ -45,7 +45,7 @@ def delete_employee(id: int):
 @mcp.tool()
 def update_employee(id: int, name: str = None, role: str = None):
     """Update an employee's name or role by their ID."""
-    db = session()
+    db = Session()
     employee = db.query(Employee).filter(Employee.id == id).first()
     if not employee:
         raise Exception("Employee not found")
@@ -61,7 +61,7 @@ def update_employee(id: int, name: str = None, role: str = None):
 @mcp.tool()
 def change_id(id: int, new_id: int):
     """Change an employee's ID."""
-    db = session()
+    db = Session()
     employee = db.query(Employee).filter(Employee.id == id).first()
     if not employee:
         return "Employee not found"
@@ -74,7 +74,7 @@ def change_id(id: int, new_id: int):
 @mcp.tool()
 def delete_employee_by_name(name: str):
     """Delete an employee by their name."""
-    db = session()
+    db = Session()
     employee = db.query(Employee).filter(Employee.name == name).first()
     if not employee:
         return "Employee not found"
@@ -87,7 +87,7 @@ def delete_employee_by_name(name: str):
 @mcp.tool()
 def search_employee_by_name(name: str):
     """Search for an employee by name."""
-    db = session()
+    db = Session()
     employee = db.query(Employee).filter(Employee.name == name).first()
     db.close()
     return str(employee) if employee else "Employee not found"
@@ -96,7 +96,7 @@ def search_employee_by_name(name: str):
 @mcp.tool()
 def search_employee_by_id(id: int):
     """Search for an employee by ID."""
-    db = session()
+    db = Session()
     employee = db.query(Employee).filter(Employee.id == id).first()
     db.close()
     return str(employee) if employee else "Employee not found"
@@ -105,7 +105,7 @@ def search_employee_by_id(id: int):
 @mcp.tool()
 def search_employee_by_role(role: str):
     """Search for all employees with a given role."""
-    db = session()
+    db = Session()
     employees = db.query(Employee).filter(Employee.role == role).all()
     db.close()
     return [str(e) for e in employees]
@@ -257,4 +257,4 @@ def execute_write_query(sql: str) -> str:
         return json.dumps({"error": str(e)})
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="sse")
